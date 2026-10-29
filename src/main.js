@@ -8,14 +8,14 @@
 
 import { Actor } from 'apify';
 import { PlaywrightCrawler, Configuration } from 'crawlee';
-import { firefox } from 'playwright-core';
-import { launchOptions as camoufoxLaunchOptions } from 'camoufox-js';
 import { readFileSync } from 'fs';
 import { normalizeCookies, validateCookies, getCookieHash, getTargetIdc } from './cookies.js';
 import { setupInterceptors, CaptchaError } from './intercept.js';
-import { setupPagination } from './paginate.js';
+import { setupPagination, waitForCount } from './paginate.js';
 import { SessionManager, detectCaptcha, detectLoggedOut } from './antibot.js';
-import { normalizeVideoItem } from './normalize/shared.js';
+import { extractSubtitleInfos, uploadSubtitles } from './subtitles.js';
+import { extractItemFromPage, normalizeItemFromPageData } from './normalize/itemDetail.js';
+import { buildJobs, postMatchesQuery } from './searchJobs.js';
 
 // Local development fallback for logging
 const logger = {
@@ -27,23 +27,15 @@ const logger = {
 
 // Configuration
 const DEFAULT_MAX_ITEMS = 200;
-const DEFAULT_STALL_LIMIT = 5;
-const DEFAULT_SCROLL_DELAY = 2000;
-
-// Resource types dropped before they hit the wire. Media (video previews in
-// particular) dominates proxy traffic and every field we collect comes from
-// intercepted JSON responses, not from rendered assets. Set BLOCK_MEDIA=false
-// to disable while debugging anti-bot behaviour.
-const BLOCKED_RESOURCE_TYPES = new Set(['image', 'media', 'font']);
-const BLOCK_MEDIA = process.env.BLOCK_MEDIA !== 'false';
-
 
 /**
  * Cookies fall back to actor-level environment variables when the input
- * omits them entirely. Set these as Secret env vars on the Actor in
- * Apify Console (Settings -> Environment variables), never as an
- * INPUT_SCHEMA default - that would commit a live session credential to
- * this repo's git history.
+ * omits them entirely - red-pharmatiq-api's payloads (built to match
+ * clockworks/tiktok-scraper's input shape) never carry sessionCookies/
+ * cookiePool, since clockworks handles its own auth. Set these as Secret
+ * env vars on the Actor in Apify Console (Settings -> Environment
+ * variables), never as an INPUT_SCHEMA default - that would commit a live
+ * session credential to this repo's git history.
  */
 function cookiesFromEnv() {
   const sessionCookies = process.env.TIKTOK_SESSION_COOKIES || '';
@@ -54,7 +46,8 @@ function cookiesFromEnv() {
       const parsed = JSON.parse(process.env.TIKTOK_COOKIE_POOL);
       if (Array.isArray(parsed)) cookiePool = parsed;
     } catch {
-      // Malformed TIKTOK_COOKIE_POOL env var - ignored
+      // Malformed TIKTOK_COOKIE_POOL env var - ignored, falls through to
+      // sessionCookies (or the caller's own input) instead.
     }
   }
 
@@ -66,9 +59,6 @@ function cookiesFromEnv() {
  */
 async function parseInput(input) {
   const envCookies = cookiesFromEnv();
-  const mode = input.mode || 'search';
-  const queries = input.queries || [];
-  const maxItems = input.maxItems || DEFAULT_MAX_ITEMS;
   const sessionCookies = input.sessionCookies || envCookies.sessionCookies;
   const cookiePool = (input.cookiePool && input.cookiePool.length > 0)
     ? input.cookiePool
@@ -77,22 +67,48 @@ async function parseInput(input) {
   const publishedWithin = input.publishedWithin || 'all';
   const dateFromMs = parseDateBound(input.dateFrom);
   const dateToMs = parseDateBound(input.dateTo, { endOfDay: true });
-  const language = input.language || 'id';
+  // No forced default - red-pharmatiq-api's ingestion pipeline already
+  // filters to Indonesian downstream (domain/language_filter.py), so scoping the
+  // scrape itself to one language would only narrow results without needing
+  // to.
+  const language = input.language || '';
   const includeComments = input.includeComments || false;
   const commentsPerPost = input.commentsPerPost || 20;
   const downloadMedia = input.downloadMedia || false;
-  const outputSchema = input.outputSchema || 'compat';
+  // 'clockworks' is the default, not 'compat': red-pharmatiq-api's payloads
+  // never set outputSchema (it's not part of clockworks' own input contract),
+  // so the shape it actually gets has to work with no explicit opt-in.
+  // Pass outputSchema:'compat' explicitly for the legacy Threads-style shape.
+  const outputSchema = input.outputSchema || 'clockworks';
+
+  // clockworks-compatible fields (red-pharmatiq-api sends these) plus the
+  // legacy mode/queries pair for backward-compatible manual runs.
+  const jobs = buildJobs({
+    hashtags: input.hashtags,
+    hashtagMatches: input.hashtagMatches,
+    searchQueries: input.searchQueries,
+    profiles: input.profiles,
+    postUrls: input.postUrls,
+    mode: input.mode,
+    queries: input.queries,
+  });
+
+  const maxItems = input.maxItems || input.resultsPerPage || DEFAULT_MAX_ITEMS;
   // Opt-in: RESIDENTIAL is billed per GB. Off by default; set true to enable.
   const useResidentialProxy = input.useResidentialProxy === true;
   const proxyCountryCode = input.proxyCountryCode || null;
+  const downloadSubtitles = input.downloadSubtitlesOptions === 'DOWNLOAD_SUBTITLES';
+  const scrapeRelatedSearchWords = input.scrapeRelatedSearchWords || false;
 
   // Validate required fields
   if (!sessionCookies && (!cookiePool || cookiePool.length === 0)) {
-    throw new Error('Either sessionCookies, cookiePool, or TIKTOK_SESSION_COOKIES env var must be provided');
+    throw new Error('Either sessionCookies or cookiePool must be provided');
   }
 
-  if (!queries.length) {
-    throw new Error('At least one query is required');
+  if (!jobs.length) {
+    throw new Error(
+      'At least one of hashtags, searchQueries, profiles, postUrls, or (mode + queries) is required'
+    );
   }
 
   // Parse cookies - support both sessionCookies and cookiePool
@@ -119,8 +135,7 @@ async function parseInput(input) {
     : null;
 
   return {
-    mode,
-    queries,
+    jobs,
     maxItems,
     cookies,
     cookiePool,
@@ -134,20 +149,24 @@ async function parseInput(input) {
     outputSchema,
     useResidentialProxy,
     proxyCountryCode,
+    downloadSubtitles,
+    scrapeRelatedSearchWords,
   };
 }
 
 /**
  * Build the TikTok URL based on mode and query
  */
-function buildUrl(mode, query, sortBy, publishedWithin, language = 'id') {
+function buildUrl(mode, query, sortBy, publishedWithin, language = '') {
   const params = new URLSearchParams();
 
   switch (mode) {
     case 'search':
-      // TikTok search uses 'q' parameter
+      // Top search, not the Videos-only tab. TikTok posts here include both
+      // videos and photo carousels. Off-keyword recommendations are dropped
+      // later by postMatchesQuery, not by narrowing the tab.
       params.set('q', query);
-      params.set('lang', language);
+      if (language) params.set('lang', language);
       if (sortBy === 'latest') {
         params.set('sort_type', '1');
       }
@@ -166,32 +185,36 @@ function buildUrl(mode, query, sortBy, publishedWithin, language = 'id') {
       return `https://www.tiktok.com/@${username}`;
     }
 
+    case 'post':
+      // query is already a full TikTok video URL - nothing to construct.
+      return query;
+
     default:
       params.set('q', query);
-      params.set('lang', language);
+      if (language) params.set('lang', language);
       return `https://www.tiktok.com/search?${params.toString()}`;
   }
 }
 
 /**
- * Map an ISO language code to a BCP 47 locale tag.
+ * Map an ISO language code to a Chromium --lang value.
  * The browser locale drives TikTok's search API language params
  * (e.g. language/app_language on /api/search/*), so it must match
  * the lang param we set on the search URL.
  */
-function toLocaleTag(code) {
+function toChromiumLang(code) {
   const map = {
-    id: 'id-ID',
-    en: 'en-US',
-    ms: 'ms-MY',
-    th: 'th-TH',
-    vi: 'vi-VN',
-    ja: 'ja-JP',
-    ko: 'ko-KR',
-    es: 'es-ES',
-    pt: 'pt-BR',
+    id: 'id-ID,id;q=0.9',
+    en: 'en-US,en;q=0.9',
+    ms: 'ms-MY,ms;q=0.9',
+    th: 'th-TH,th;q=0.9',
+    vi: 'vi-VN,vi;q=0.9',
+    ja: 'ja-JP,ja;q=0.9',
+    ko: 'ko-KR,ko;q=0.9',
+    es: 'es-ES,es;q=0.9',
+    pt: 'pt-BR,pt;q=0.9',
   };
-  return map[code] || 'en-US';
+  return map[code] || 'en-US,en;q=0.9';
 }
 
 /**
@@ -232,16 +255,18 @@ function publishTimeToCode(within) {
 }
 
 /**
- * Check a normalized item against the dateRange filter.
+ * Check a normalized wrapper item against the dateRange filter.
  * Applies to posts only (comments are left untouched); posts with an
  * unknown/invalid timestamp are excluded when a range is active.
  */
-function isWithinDateRange(item, range) {
+function isWithinDateRange(wrapperItem, range) {
   if (!range) return true;
-  if (item._type === 'comment') return true;
-  if (!item.timestamp) return false;
+  const compat = wrapperItem.compat;
+  if (!compat) return true;
+  if (compat._type === 'comment') return true;
+  if (!compat.timestamp) return false;
 
-  const ms = new Date(item.timestamp).getTime();
+  const ms = new Date(compat.timestamp).getTime();
   if (Number.isNaN(ms)) return false;
 
   if (range.from !== null && ms < range.from) return false;
@@ -250,36 +275,104 @@ function isWithinDateRange(item, range) {
 }
 
 /**
- * Filter item based on outputSchema setting
+ * Turn a normalized wrapper item ({ id, compat, clockworks, raw }) into the
+ * final dataset record, based on the outputSchema setting.
  */
-function filterByOutputSchema(item, schema) {
-  if (schema === 'native') return item;
-  
+function filterByOutputSchema(wrapperItem, schema) {
+  const { compat, clockworks, raw } = wrapperItem;
+
+  if (schema === 'clockworks') return clockworks;
+  if (schema === 'native') return raw;
+
   if (schema === 'both') {
-    return { ...item, _raw: item };
+    return { ...compat, _raw: raw };
   }
-  
+
   // 'compat' - Threads-style format (only fields from sample-output.json)
+  if (!compat) return null;
   return {
-    post_id: item.post_id,
-    shortcode: item.shortcode,
-    post_url: item.post_url,
-    text: item.text,
-    timestamp: item.timestamp,
-    user: item.user,
-    likes: item.likes,
-    replies: item.replies,
-    reposts: item.reposts,
-    quotes: item.quotes,
-    reshares: item.reshares,
-    views: item.views,
-    saves: item.saves,
-    bookmarks: item.bookmarks,
-    images: item.images,
-    videos: item.videos,
-    is_reply: item.is_reply,
-    source: item.source,
+    post_id: compat.post_id,
+    shortcode: compat.shortcode,
+    post_url: compat.post_url,
+    text: compat.text,
+    timestamp: compat.timestamp,
+    user: compat.user,
+    likes: compat.likes,
+    replies: compat.replies,
+    reposts: compat.reposts,
+    quotes: compat.quotes,
+    reshares: compat.reshares,
+    views: compat.views,
+    images: compat.images,
+    videos: compat.videos,
+    is_reply: compat.is_reply,
+    source: compat.source,
+    comments: compat.comments,
   };
+}
+
+/**
+ * Fetch and re-host TikTok's native subtitles for one video item into this
+ * run's key-value store, mutating item.clockworks.videoMeta.subtitleLinks in
+ * place. Gated behind config.downloadSubtitles; never throws.
+ */
+async function attachSubtitles(page, wrapperItem, kvStore, log) {
+  if (!wrapperItem.clockworks || !wrapperItem.raw) return;
+  const infos = extractSubtitleInfos(wrapperItem.raw, log);
+  if (!infos.length) return;
+
+  const links = await uploadSubtitles(page, wrapperItem.id, infos, kvStore, log);
+  if (links.length) {
+    wrapperItem.clockworks.videoMeta.subtitleLinks = links;
+  }
+}
+
+let loggedMissingRelatedWordsOnce = false;
+
+/**
+ * Read TikTok's "Others also searched for" related keywords off a search
+ * results page (clockworks' scrapeRelatedSearchWords option). This is
+ * UI-rendered content, not present in any network response this actor
+ * already intercepts, so it's read straight from the DOM - the selectors
+ * below are best-known guesses (matching this file's existing search-result
+ * selectors' data-e2e naming convention), not independently live-verified.
+ * If none match, logs the data-e2e attributes actually present on the page
+ * once per run so it's fast to correct.
+ */
+async function extractRelatedSearchWords(page, log) {
+  const words = await page.evaluate(() => {
+    const selectors = [
+      '[data-e2e="search-common-link"]',
+      '[data-e2e="search-common-list"] a',
+      '[data-e2e="related-search"] a',
+      '[data-e2e="search-common"] a',
+    ];
+    for (const sel of selectors) {
+      const els = document.querySelectorAll(sel);
+      if (els.length) {
+        return Array.from(els)
+          .map((el) => el.textContent?.trim())
+          .filter(Boolean);
+      }
+    }
+    return [];
+  });
+
+  if (!words.length && !loggedMissingRelatedWordsOnce) {
+    loggedMissingRelatedWordsOnce = true;
+    const dataE2eSeen = await page.evaluate(() =>
+      Array.from(new Set(
+        Array.from(document.querySelectorAll('[data-e2e]')).map((el) => el.getAttribute('data-e2e'))
+      )).filter(Boolean).slice(0, 60)
+    );
+    log.warning(
+      'scrapeRelatedSearchWords: no "Others also searched for" chips matched any known ' +
+      `selector (see extractRelatedSearchWords in src/main.js). data-e2e attributes seen ` +
+      `on this page: [${dataE2eSeen.join(', ')}]`
+    );
+  }
+
+  return words;
 }
 
 /**
@@ -287,55 +380,57 @@ function filterByOutputSchema(item, schema) {
  */
 async function scrapeComments(page, videoId, authorUsername, config) {
   if (!config.includeComments) return [];
-  
+
   const log = Actor.log;
   log.info(`Scraping comments for video: ${videoId}`);
-  
+
   const comments = [];
   const dedupSet = new Set();
-  
+
   // Setup comment interceptor
   setupInterceptors(page, {
     endpoints: ['/api/comment/list/'],
     dedupSet,
     onItem: (item) => {
-      if (item._type === 'comment') {
-        comments.push(item);
+      if (item.compat && item.compat._type === 'comment') {
+        comments.push(item.compat);
       }
     },
     onError: (error) => {
       log.warning(`Comment interceptor error: ${error.message}`);
     },
   });
-  
+
   // Navigate to video page
   await page.goto(`https://www.tiktok.com/@${authorUsername}/video/${videoId}`, {
     waitUntil: 'domcontentloaded',
     timeout: 30000,
   });
-  
+
   // Wait for comments to load
   await page.waitForTimeout(2000);
-  
+
   // Scroll to load more comments
   await setupPagination(page, {
     targetCount: config.commentsPerPost,
     stallLimit: 3,
     scrollDelay: 1500,
   });
-  
+
   return comments;
 }
 
 /**
- * Main scraping function for a single query
+ * Main scraping function for a single job ({ mode, query })
  */
-async function scrapeQuery(page, context, query, config) {
+async function scrapeQuery(page, context, job, config, kvStore) {
   const { log } = context;
+  const { mode, query, match } = job;
   const results = [];
   const dedupSet = new Set();
+  const subtitleTasks = [];
 
-  log.info(`Scraping query: "${query}"`);
+  log.info(`Scraping ${mode} job: "${query}"`);
 
   if (config.dateRange) {
     const fmt = (ms) => (ms === null ? '∞' : new Date(ms).toISOString());
@@ -343,10 +438,23 @@ async function scrapeQuery(page, context, query, config) {
   }
 
   let skippedByDate = 0;
+  let skippedByKeyword = 0;
+  let examined = 0;
 
   // Build URL
-  const url = buildUrl(config.mode, query, config.sortBy, config.publishedWithin, config.language);
+  const url = buildUrl(mode, query, config.sortBy, config.publishedWithin, config.language);
   log.info(`Navigating to: ${url}`);
+
+  // Diagnostic only for 'post' mode: if /api/item_detail/ turns out to be
+  // the wrong endpoint name (unverified live - see normalize/itemDetail.js),
+  // this lets us log what TikTok actually called so it's fast to fix.
+  const seenApiUrls = [];
+  if (mode === 'post') {
+    page.on('response', (res) => {
+      const u = res.url();
+      if (u.includes('/api/')) seenApiUrls.push(u);
+    });
+  }
 
   // Setup interceptor BEFORE navigation - captures initial search API response
   setupInterceptors(page, {
@@ -356,14 +464,30 @@ async function scrapeQuery(page, context, query, config) {
       '/api/challenge/item_list/',
       '/api/post/item_list/',
       '/api/comment/list/',
+      '/api/item_detail/',
     ],
     dedupSet,
+    meta: { inputValue: query, log },
     onItem: (item) => {
+      // Cap how many TikTok rows we even look at. Rejected rows still count,
+      // so a loose page cannot keep scrolling until it invents enough
+      // on-keyword hits.
+      if (examined >= config.maxItems) return;
+      examined += 1;
       if (!isWithinDateRange(item, config.dateRange)) {
         skippedByDate += 1;
         return;
       }
+      if (mode === 'search' && !postMatchesQuery(item, match || query)) {
+        skippedByKeyword += 1;
+        return;
+      }
+      if (results.length >= config.maxItems) return;
       results.push(item);
+
+      if (config.downloadSubtitles) {
+        subtitleTasks.push(attachSubtitles(page, item, kvStore, log));
+      }
     },
     onError: (error) => {
       log.warning(`Interceptor error: ${error.message}`);
@@ -375,78 +499,173 @@ async function scrapeQuery(page, context, query, config) {
   // analytics beacons keep the network busy forever and goto always times
   // out after 60s (see run log: page.goto Timeout 60000ms exceeded).
   // domcontentloaded + explicit wait for results/captcha is reliable.
-  let navigated = false;
-  let lastGotoError = null;
-  for (let attempt = 1; attempt <= 2 && !navigated; attempt += 1) {
+  //
+  // RENDER RETRY: real runs show TikTok's search SPA occasionally takes
+  // longer than one navigation+wait cycle to actually paint results -
+  // observed correlated with the container's memory/CPU being reported
+  // "critically overloaded" by Crawlee's Snapshotter, and separately as a
+  // spurious captcha/login-wall state that clears up on a fresh load. Both
+  // previously surfaced as a false "0 items" for a query that has real
+  // content (confirmed many times in practice: an identical re-run of the
+  // same query, seconds later, returns real results). Rather than reporting
+  // a false empty result and relying on the CALLER to blindly retry the
+  // whole actor run, retry the render itself up to RENDER_ATTEMPTS times
+  // in-process before giving up - a fresh page.goto (not just re-waiting)
+  // since a full reload is what actually clears the transient bad state.
+  const RENDER_ATTEMPTS = 4;
+  let renderSucceeded = false;
+  for (let renderAttempt = 1; renderAttempt <= RENDER_ATTEMPTS; renderAttempt += 1) {
+    let navigated = false;
+    let lastGotoError = null;
+    for (let attempt = 1; attempt <= 2 && !navigated; attempt += 1) {
+      try {
+        await page.goto(url, {
+          waitUntil: 'domcontentloaded',
+          timeout: 30000,
+        });
+        navigated = true;
+      } catch (err) {
+        lastGotoError = err;
+        log.warning(`Navigation attempt ${attempt}/2 failed: ${err.message.split('\n')[0]}`);
+        if (attempt < 2) await page.waitForTimeout(2000);
+      }
+    }
+    if (!navigated) throw lastGotoError;
+
+    // Give TikTok's SPA a moment to boot, then check what we actually got
+    // (results, captcha wall, or login wall) instead of waiting blindly.
+    await page.waitForTimeout(3000);
     try {
-      await page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: 30000,
-      });
-      navigated = true;
+      await page.waitForSelector(
+        'a[href*="/video/"], [data-e2e="search_top-item"], [data-e2e="search_video-item"], #captcha_container, #captcha-verify, [data-e2e="captcha-container"]',
+        { timeout: 25000 }
+      );
+      renderSucceeded = true;
+    } catch {
+      // Selector timeout is non-fatal on its own - pagination/interceptor
+      // may still have captured API responses via network interception
+      // even though the DOM never showed a recognized marker.
+    }
+
+    try {
+      if (await detectCaptcha(page)) {
+        throw new CaptchaError(10000, 'Captcha wall detected after navigation');
+      }
     } catch (err) {
-      lastGotoError = err;
-      log.warning(`Navigation attempt ${attempt}/2 failed: ${err.message.split('\n')[0]}`);
-      if (attempt < 2) await page.waitForTimeout(2000);
+      if (err?.name === 'CaptchaError') throw err;
+      // detectCaptcha itself failed (e.g. page closed) - ignore, continue
     }
-  }
-  if (!navigated) throw lastGotoError;
 
-  // Give TikTok's SPA a moment to boot, then check what we actually got
-  // (results, captcha wall, or login wall) instead of waiting blindly.
-  await page.waitForTimeout(3000);
-  try {
-    await page.waitForSelector(
-      'a[href*="/video/"], [data-e2e="search_top-item"], [data-e2e="search_video-item"], #captcha_container, #captcha-verify, [data-e2e="captcha-container"]',
-      { timeout: 20000 }
-    );
-  } catch {
-    // Selector timeout is non-fatal - pagination/interceptor may still
-    // have captured API responses; log state for diagnostics.
-    log.warning('Timed out waiting for search results/captcha selector; continuing anyway');
-  }
+    // Either the selector resolved, or the interceptor already captured
+    // items from the network response regardless of DOM state - both count
+    // as a real render, no need to burn further attempts.
+    if (renderSucceeded || results.length > 0) break;
 
-  const { detectCaptcha } = await import('./antibot.js');
-  try {
-    if (await detectCaptcha(page)) {
-      const { CaptchaError: CaptchaErr } = await import('./intercept.js');
-      throw new CaptchaErr(10000, 'Captcha wall detected after navigation');
+    if (renderAttempt < RENDER_ATTEMPTS) {
+      log.warning(
+        `Timed out waiting for search results/captcha selector (render attempt ${renderAttempt}/${RENDER_ATTEMPTS}, 0 items so far) - reloading and retrying`
+      );
+      await page.waitForTimeout(2000);
+    } else {
+      log.warning(
+        `Timed out waiting for search results/captcha selector after ${RENDER_ATTEMPTS} render attempts; continuing with whatever was captured (${results.length} items)`
+      );
     }
-  } catch (err) {
-    if (err?.name === 'CaptchaError') throw err;
-    // detectCaptcha itself failed (e.g. page closed) - ignore, continue
   }
 
   log.info(`Results after initial load: ${results.length}`);
 
-  // Scroll-based pagination: TikTok's own JS loads more pages as we scroll,
-  // and the interceptor captures each new API response
-  await setupPagination(page, {
-    targetCount: config.maxItems,
-    stallLimit: 3,
-    scrollDelay: 2500,
-    onScroll: (info) => {
-      log.info(`Scroll ${info.scrollCount}: captured=${results.length}, DOM=${info.currentCount} (${info.itemsGained} new)`);
-    },
-    onComplete: (result) => {
-      log.info(`Pagination complete: ${result.reason}, captured=${results.length} items`);
-    },
-  });
+  let relatedSearchWords = [];
+  if (mode === 'search' && config.scrapeRelatedSearchWords) {
+    relatedSearchWords = await extractRelatedSearchWords(page, log);
+    log.info(`Related search words: ${relatedSearchWords.length ? relatedSearchWords.join(', ') : '(none found)'}`);
+  }
 
-  log.info(`Scraped ${results.length} items for query: "${query}"` +
+  if (mode === 'post') {
+    // Primary path (confirmed via a real run's logs on 2026-09-18): the
+    // video detail page is server-side rendered, so the item is already in
+    // the HTML by the time 'domcontentloaded' fires - no network wait
+    // needed. See normalize/itemDetail.js for the extraction details.
+    const rawItem = await extractItemFromPage(page);
+    if (rawItem) {
+      for (const item of normalizeItemFromPageData(rawItem, dedupSet, { inputValue: query, log })) {
+        if (!isWithinDateRange(item, config.dateRange)) {
+          skippedByDate += 1;
+          continue;
+        }
+        if (results.length >= config.maxItems) break;
+        results.push(item);
+        if (config.downloadSubtitles) {
+          subtitleTasks.push(attachSubtitles(page, item, kvStore, log));
+        }
+      }
+    }
+
+    // Fallback only: give the network-intercept path (registered above,
+    // /api/item_detail/) a brief window in case it does fire in some
+    // scenario this session's one real run didn't cover.
+    if (results.length === 0) {
+      await waitForCount({ getCount: () => results.length, targetCount: 1, timeout: 5000 });
+    }
+
+    log.info(`Post detail extraction complete: captured=${results.length} items`);
+
+    if (results.length === 0) {
+      log.warning(
+        `No item captured for post URL "${query}" - the embedded SSR state ` +
+        `(__UNIVERSAL_DATA_FOR_REHYDRATION__/SIGI_STATE) and /api/item_detail/ both came up ` +
+        `empty (see normalize/itemDetail.js). API calls seen during this page load: ` +
+        `${seenApiUrls.length ? seenApiUrls.join(', ') : '(none matched /api/)'}`
+      );
+    }
+  } else {
+    // Scroll-based pagination: TikTok's own JS loads more pages as we scroll,
+    // and the interceptor captures each new API response
+    await setupPagination(page, {
+      targetCount: config.maxItems,
+      stallLimit: 3,
+      scrollDelay: 2500,
+      getCount: () => examined,
+      onScroll: (info) => {
+        log.info(`Scroll ${info.scrollCount}: captured=${info.currentCount} (${info.itemsGained} new)`);
+      },
+      onComplete: (result) => {
+        log.info(`Pagination complete: ${result.reason}, captured=${results.length} items`);
+      },
+    });
+  }
+
+  log.info(`Scraped ${results.length} items for ${mode} job: "${query}"` +
+    (skippedByKeyword > 0 ? ` (skipped ${skippedByKeyword} with no keyword mention)` : '') +
     (skippedByDate > 0 ? ` (skipped ${skippedByDate} outside date range)` : ''));
+
+  // clockworks adds the related search words to every video result from
+  // the job that found them - applied here, after collection, so it covers
+  // items gathered during scrolling too, not just the initial load.
+  if (relatedSearchWords.length) {
+    for (const item of results) {
+      if (item.clockworks) item.clockworks.relatedSearchWords = relatedSearchWords;
+    }
+  }
+
+  // Wait for any in-flight subtitle downloads/uploads to finish before this
+  // job's items are pushed to the dataset.
+  if (subtitleTasks.length) {
+    log.info(`Waiting for ${subtitleTasks.length} subtitle fetch(es) to finish`);
+    await Promise.all(subtitleTasks);
+  }
 
   // Optionally scrape comments for each video
   if (config.includeComments) {
-    const videosWithComments = results.filter((r) => r.videos && r.videos.length > 0);
+    const videosWithComments = results.filter((r) => r.compat?.videos && r.compat.videos.length > 0);
     log.info(`Scraping comments for ${videosWithComments.length} videos`);
-    
+
     for (const video of videosWithComments.slice(0, 10)) {
       try {
-        const comments = await scrapeComments(page, video.post_id, video.user.username, config);
-        video.comments = comments;
+        const comments = await scrapeComments(page, video.compat.post_id, video.compat.user.username, config);
+        video.compat.comments = comments;
       } catch (error) {
-        log.warning(`Failed to scrape comments for ${video.post_id}: ${error.message}`);
+        log.warning(`Failed to scrape comments for ${video.compat.post_id}: ${error.message}`);
       }
     }
   }
@@ -463,7 +682,7 @@ async function scrapeQuery(page, context, query, config) {
  */
 Actor.main(async () => {
   let input = await Actor.getInput();
-  
+
   // Fallback: read from local input file when not on Apify platform
   if (!input || Object.keys(input).length === 0) {
     try {
@@ -473,24 +692,30 @@ Actor.main(async () => {
       input = {};
     }
   }
-  
+
   const log = Actor.log || logger;
 
   log.info('Starting TikTok Scraper Actor');
 
   // Parse and validate input
   const config = await parseInput(input);
-  log.info(`Mode: ${config.mode}, Queries: ${config.queries.join(', ')}, Max Items: ${config.maxItems}`);
+  // A bulk 'post' run can carry thousands of jobs - list them individually
+  // only for small runs, otherwise just log the count per mode.
+  const jobsSummary = config.jobs.length <= 20
+    ? config.jobs.map((j) => `${j.mode}:${j.query}`).join(', ')
+    : Object.entries(
+        config.jobs.reduce((counts, j) => ({ ...counts, [j.mode]: (counts[j.mode] || 0) + 1 }), {})
+      ).map(([m, count]) => `${count} ${m} job(s)`).join(', ');
+  log.info(
+    `Jobs: ${jobsSummary}, Max Items: ${config.maxItems}` +
+      (config.downloadSubtitles ? ', subtitles: on' : '') +
+      (config.scrapeRelatedSearchWords ? ', related search words: on' : '')
+  );
 
-  // Log session identity for debugging
+  // Calculate session ID for proxy pinning
   const cookieHash = getCookieHash(config.cookies);
   const targetIdc = getTargetIdc(config.cookies);
   log.info(`Session hash: ${cookieHash}, Target IDC: ${targetIdc || 'auto'}`);
-
-  // proxyCountryCode takes priority over the tt-target-idc-derived guess when choosing the proxy exit region.
-  // Indonesian TikTok also uses the alisg IDC — prefer ID there, not SG.
-  const proxyCountryCode = config.proxyCountryCode
-    || (targetIdc === 'useast2a' ? 'US' : 'ID');
 
   // Initialize session manager
   const sessions = config.cookiePool.length > 0
@@ -498,101 +723,114 @@ Actor.main(async () => {
     : [config.cookies];
   const sessionManager = new SessionManager(sessions, { maxRetriesPerSession: 3 });
 
-  const blockAssets = BLOCK_MEDIA && !config.downloadMedia;
-  if (blockAssets) {
-    log.info(`Blocking ${[...BLOCKED_RESOURCE_TYPES].join('/')} requests to cut proxy traffic`);
-  }
+  // Shared key-value store for this run - used to persist refreshed cookies,
+  // run metadata, and (when downloadSubtitlesOptions is on) re-hosted
+  // subtitle text so red-pharmatiq-api can fetch it without a TikTok cookie.
+  const kvStore = await Actor.openKeyValueStore();
+
+  // proxyCountryCode (clockworks-compatible input field) takes priority over
+  // the tt-target-idc-derived guess when choosing the proxy exit region.
+  // Indonesian TikTok also uses the alisg IDC — prefer ID there, not SG.
+  const proxyCountryCode = config.proxyCountryCode
+    || (targetIdc === 'useast2a' ? 'US' : 'ID');
 
   // Create crawler
   const crawlerOptions = {
     maxRequestRetries: 3,
     requestHandlerTimeoutSecs: 300,
-    browserPoolOptions: {
-      // Camoufox spoofs fingerprints at the browser level — Crawlee must not
-      // layer its own generated fingerprint (UA/screen/viewport) on top of it.
-      useFingerprints: false,
-      // Playwright's default 1280x720 viewport fights Camoufox's spoofed
-      // window dimensions (the page would report the emulated viewport, and a
-      // second page on the same browser can hang). Null the viewport so
-      // Firefox measures the real window, and keep one page per browser.
-      maxOpenPagesPerBrowser: 1,
-      prePageCreateHooks: [
-        async (_pageId, _browserController, pageOptions = {}) => {
-          pageOptions.viewport = null;
-        },
-      ],
-    },
+    // Modest concurrency ceiling - without this Crawlee's autoscaler tends to
+    // sit near 1 on typical actor memory allocations, which is fine for a
+    // handful of keyword jobs but far too slow for bulk 'post' mode (each
+    // post URL is its own job). 5 is a deliberate middle ground: enough
+    // throughput for large postUrls batches without hammering TikTok with
+    // too many concurrent requests from the same session/account.
+    minConcurrency: 1,
+    maxConcurrency: 5,
     launchContext: {
-      // Camoufox is a stealth-patched Firefox driven through the Playwright
-      // Firefox protocol, so it drops in as a replacement launcher. All
-      // fingerprint/stealth handling happens at the C++ level inside the
-      // browser — no Chromium stealth args or JS init-script overrides needed.
-      launcher: firefox,
-      // Incognito pages are required so Crawlee passes pageOptions through to
-      // newPage() (needed to disable the default viewport below) and gives
-      // each page a fresh context so sessions don't leak between cookies.
-      useIncognitoPages: true,
-      ignoreProxyCertificate: true,
       launchOptions: {
-        ...(await camoufoxLaunchOptions({
-          headless: true,
-          locale: toLocaleTag(config.language),
-          block_webrtc: true,
-          // humanize: true, // enable to humanize cursor movement
-        })),
-        ignoreHTTPSErrors: true,
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-blink-features=AutomationControlled',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--disable-gpu',
+          '--window-size=1920,1080',
+          `--lang=${toChromiumLang(config.language)}`,
+        ],
       },
     },
     preNavigationHooks: [
       async (crawlingContext, gotoOptions) => {
         const { page } = crawlingContext;
+        // Override navigator.webdriver to avoid detection
+        await page.addInitScript(() => {
+          Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined,
+          });
+          // Override chrome detection
+          window.chrome = { runtime: {} };
+          // Override permissions
+          const originalQuery = window.navigator.permissions.query;
+          window.navigator.permissions.query = (parameters) =>
+            parameters.name === 'notifications'
+              ? Promise.resolve({ state: Notification.permission })
+              : originalQuery(parameters);
+        });
 
-        if (gotoOptions) {
-          gotoOptions.waitUntil = 'domcontentloaded';
-          gotoOptions.timeout = 30000;
-        }
+        // Data comes from TikTok's JSON API, not from rendered media. Video
+        // previews, images, and fonts still download through the proxy on
+        // every scroll. CSS stays so the results container keeps its scroll height.
+        await page.route('**/*', (route) => {
+          const request = route.request();
+          const type = request.resourceType();
+          const url = request.url();
+          const isVideoUrl = /\.(mp4|m3u8|webm|ts)(\?|$)/i.test(url) || url.includes('mime_type=video');
+          if (type === 'image' || type === 'media' || type === 'font' || isVideoUrl) {
+            return route.abort();
+          }
+          return route.continue();
+        });
 
-        // Inject cookies prior to navigation so initial request carries session identity
-        const currentSession = sessionManager.getCurrent();
-        if (currentSession && currentSession.length > 0) {
-          await page.context().addCookies(currentSession);
-        }
-
-        // Drop images/video/fonts before they consume proxy bandwidth.
-        // NOTE: no addInitScript stealth overrides here — Camoufox spoofs
-        // navigator.webdriver, chrome detection, etc. natively, and JS-level
-        // overrides on top of it would only add a detectable inconsistency.
-        if (blockAssets) {
-          await page.route('**/*', (route) =>
-            BLOCKED_RESOURCE_TYPES.has(route.request().resourceType())
-              ? route.abort()
-              : route.continue()
-          );
-        }
+        // Crawlee does its OWN page.goto(request.url) here, before
+        // requestHandler runs - gotoOptions controls that call. Without this,
+        // it silently defaults to Playwright's waitUntil:'load', which on
+        // TikTok often never fires (persistent video-buffering/beacon
+        // traffic keeps the page "loading" forever from the browser's
+        // perspective) - reliably timing out at 60s on video detail pages in
+        // particular, before scrapeQuery's own (already domcontentloaded)
+        // navigation ever gets a chance to run. See scrapeQuery's own goto
+        // call for the same reasoning.
+        gotoOptions.waitUntil = 'domcontentloaded';
+        gotoOptions.timeout = 30000;
       },
     ],
     async requestHandler({ page, request }) {
-      const query = request.userData.query;
+      const job = request.userData.job;
       const currentSession = sessionManager.getCurrent();
 
       // Inject cookies from current session
       const context = page.context();
       await context.addCookies(currentSession);
 
-      // Scrape the query
+      // Scrape the job
       try {
-        const result = await scrapeQuery(page, { log: Actor.log || logger }, query, config);
+        const result = await scrapeQuery(page, { log: Actor.log || logger }, job, config, kvStore);
 
         // Push items to dataset
+        let pushed = 0;
         for (const item of result.items) {
           const filtered = filterByOutputSchema(item, config.outputSchema);
+          if (filtered === null || filtered === undefined) continue;
           await Actor.pushData(filtered);
+          pushed += 1;
         }
 
-        log.info(`Pushed ${result.items.length} items to dataset for query: "${query}"`);
+        log.info(`Pushed ${pushed} items to dataset for ${job.mode} job: "${job.query}"`);
       } catch (error) {
         // Handle session rotation on failure
-        log.error(`Error scraping "${query}": ${error.message}`);
+        log.error(`Error scraping "${job.query}": ${error.message}`);
         if (sessionManager.hasRemaining()) {
           sessionManager.markFailed(error.message);
           const nextSession = sessionManager.rotate();
@@ -632,9 +870,6 @@ Actor.main(async () => {
           crawlerOptions.proxyConfiguration = {
             proxyUrls: [customProxyUrl],
           };
-          if (!crawlerOptions.launchContext.launchOptions) {
-            crawlerOptions.launchContext.launchOptions = {};
-          }
           crawlerOptions.launchContext.launchOptions.proxy = {
             server: customProxyUrl,
           };
@@ -654,12 +889,12 @@ Actor.main(async () => {
 
   const crawler = new PlaywrightCrawler(crawlerOptions, Configuration.getGlobalConfig());
 
-  // Queue all queries as requests
-  const requests = config.queries.map((query) => ({
-    url: buildUrl(config.mode, query, config.sortBy, config.publishedWithin, config.language),
-    userData: { query },
+  // Queue all jobs as requests
+  const requests = config.jobs.map((job) => ({
+    url: buildUrl(job.mode, job.query, config.sortBy, config.publishedWithin, config.language),
+    userData: { job },
   }));
-  
+
   await crawler.addRequests(requests);
 
   // Run crawler
@@ -668,7 +903,6 @@ Actor.main(async () => {
   // Persist refreshed cookies back to KV store
   // msToken rotates constantly and a stale one degrades results
   try {
-    const kvStore = await Actor.openKeyValueStore();
     const refreshedCookies = sessionManager.getCurrent();
     await kvStore.setValue('session_cookies_latest', refreshedCookies);
     log.info('Persisted refreshed cookies to KV store');
@@ -679,7 +913,6 @@ Actor.main(async () => {
   // Download media if requested
   if (config.downloadMedia) {
     log.info('Downloading media files to KV store...');
-    const kvStore = await Actor.openKeyValueStore();
     // Note: media download would need access to all scraped items
     // This would be handled per-request in a production implementation
     log.info('Media download complete');
@@ -693,8 +926,10 @@ Actor.main(async () => {
   // Output metadata
   await Actor.setValue('OUTPUT_METADATA', {
     scraped_at: new Date().toISOString(),
-    queries: config.queries,
-    mode: config.mode,
+    // Full job list only for small runs - a bulk 'post' run can carry
+    // thousands of jobs, which doesn't belong in a small metadata record.
+    jobs: config.jobs.length <= 20 ? config.jobs : undefined,
+    job_count: config.jobs.length,
     total_items: stats?.itemCount || 0,
   });
 

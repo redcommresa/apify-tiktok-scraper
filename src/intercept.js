@@ -8,6 +8,7 @@
 import { normalizeSearchItem, normalizeSearchGeneral } from './normalize/searchItem.js';
 import { normalizeChallengeItem } from './normalize/challengeItem.js';
 import { normalizeCommentList } from './normalize/comment.js';
+import { normalizeItemDetail } from './normalize/itemDetail.js';
 
 // API endpoint path matchers
 export const ENDPOINTS = {
@@ -17,6 +18,9 @@ export const ENDPOINTS = {
   POST_ITEM_LIST: '/api/post/item_list/',
   COMMENT_LIST: '/api/comment/list/',
   USER_DETAIL: '/api/user/detail/',
+  // Single video page hydration - used by 'post' mode (scrape by post URL).
+  // See normalize/itemDetail.js for the endpoint-name caveat.
+  ITEM_DETAIL: '/api/item_detail/',
 };
 
 // TikTok API status codes
@@ -52,6 +56,7 @@ export function setupInterceptors(page, options = {}) {
     onError = () => {},
     endpoints = Object.values(ENDPOINTS),
     dedupSet = null,
+    meta = {},
   } = options;
 
   const seenIds = dedupSet || new Set();
@@ -69,21 +74,25 @@ export function setupInterceptors(page, options = {}) {
     try {
       const json = await res.json();
 
-      // Check for error status codes
-      if (json.status_code && json.status_code !== STATUS_CODES.OK) {
-        if (json.status_code === STATUS_CODES.CAPTCHA) {
-          throw new CaptchaError(json.status_code);
+      // Check for error status codes. Search/challenge endpoints use
+      // snake_case status_code; /api/item_detail/ uses camelCase statusCode
+      // for the same field - check both rather than silently missing
+      // captcha/rate-limit signals on the item-detail path.
+      const statusCode = json.status_code ?? json.statusCode;
+      if (statusCode && statusCode !== STATUS_CODES.OK) {
+        if (statusCode === STATUS_CODES.CAPTCHA) {
+          throw new CaptchaError(statusCode);
         }
-        if (json.status_code === STATUS_CODES.RATE_LIMIT) {
+        if (statusCode === STATUS_CODES.RATE_LIMIT) {
           throw new RateLimitError();
         }
         // Other status codes - log and continue
-        onError(new Error(`API error: ${json.status_code}`));
+        onError(new Error(`API error: ${statusCode}`));
         return;
       }
 
       // Route to appropriate normalizer
-      const normalized = normalizeResponse(json, matchedEndpoint, seenIds);
+      const normalized = normalizeResponse(json, matchedEndpoint, seenIds, meta);
 
       if (normalized && normalized.length > 0) {
         for (const item of normalized) {
@@ -117,18 +126,20 @@ export function setupInterceptors(page, options = {}) {
 /**
  * Route a response to the correct normalizer based on endpoint
  */
-function normalizeResponse(data, endpoint, seenIds) {
+function normalizeResponse(data, endpoint, seenIds, meta = {}) {
   switch (endpoint) {
     case ENDPOINTS.SEARCH_GENERAL:
-      return normalizeSearchGeneral(data, seenIds);
+      return normalizeSearchGeneral(data, seenIds, meta);
     case ENDPOINTS.SEARCH_ITEM:
-      return normalizeSearchItem(data, seenIds);
+      return normalizeSearchItem(data, seenIds, meta);
     case ENDPOINTS.CHALLENGE_ITEM:
-      return normalizeChallengeItem(data, seenIds);
+      return normalizeChallengeItem(data, seenIds, meta);
     case ENDPOINTS.POST_ITEM_LIST:
-      return normalizeSearchItem(data, seenIds); // Same structure as search
+      return normalizeSearchItem(data, seenIds, meta); // Same structure as search
     case ENDPOINTS.COMMENT_LIST:
       return normalizeCommentList(data, seenIds);
+    case ENDPOINTS.ITEM_DETAIL:
+      return normalizeItemDetail(data, seenIds, meta);
     default:
       return [];
   }

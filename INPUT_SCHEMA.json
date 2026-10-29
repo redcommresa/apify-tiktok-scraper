@@ -3,31 +3,80 @@
   "description": "Scrapes TikTok videos, profiles, and hashtags using session cookies. Uses network interception to capture data directly from TikTok's API without DOM parsing.",
   "type": "object",
   "schemaVersion": 1,
-  "required": ["queries"],
   "properties": {
-    "mode": {
-      "title": "Scraping Mode",
-      "type": "string",
-      "enum": ["search", "hashtag", "profile"],
-      "description": "The type of scraping to perform. 'search' for keyword search, 'hashtag' for hashtag feeds, 'profile' for user profile feeds.",
-      "default": "search",
-      "editor": "select"
+    "profiles": {
+      "title": "Profiles",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Usernames (with or without @) to scrape as profile feeds. Non-empty entries are queued as profile-feed jobs. Used by red-pharmatiq-api's POST /api/scrape/tiktok/profile.",
+      "default": [],
+      "editor": "json"
     },
-    "queries": {
+    "hashtags": {
+      "title": "Hashtags / Keywords",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "The field red-pharmatiq-api actually sends brand keywords in. Unlike clockworks/tiktok-scraper (which OR-matches these as hashtags via the challenge feed), this actor strips a leading '#' and runs each as a real TikTok keyword search for better precision. Optional keywords are sent already prefixed with the brand (e.g. 'Panadol Udahin aduhnya').",
+      "default": [],
+      "editor": "json"
+    },
+    "searchQueries": {
       "title": "Search Queries",
       "type": "array",
       "items": {
         "type": "string"
       },
-      "description": "List of search queries, hashtags (with #), or usernames (with @) to scrape.",
-      "default": ["SamsungGalaxyS25Ultra"],
+      "description": "List of search queries to scrape.",
+      "default": [],
       "editor": "json"
     },
-    "maxItems": {
-      "title": "Max Items Per Query",
+    "queries": {
+      "title": "Queries (Legacy Alias)",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "List of search queries, hashtags (with #), or usernames (with @) to scrape.",
+      "default": [],
+      "editor": "json"
+    },
+    "mode": {
+      "title": "Scraping Mode",
+      "type": "string",
+      "enum": ["search", "hashtag", "profile", "post"],
+      "description": "The type of scraping to perform when using queries: 'search', 'hashtag', 'profile', or 'post'.",
+      "default": "search",
+      "editor": "select"
+    },
+    "hashtagMatches": {
+      "title": "Hashtag match needles",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Optional caption/hashtag needle for each hashtags entry, same index. When set, TikTok is searched with hashtags[i] but a result is kept when it mentions hashtagMatches[i]. Empty or omitted entries fall back to the search query itself, so older payloads keep working. Used so an optional keyword searched as 'Panadol Udahin aduhnya' still keeps a post that only says 'Udahin aduhnya'.",
+      "default": [],
+      "editor": "json"
+    },
+    "postUrls": {
+      "title": "Post URLs",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Direct TikTok post URLs (e.g. 'https://www.tiktok.com/@user/video/123...') to re-scrape individually - one job per URL, no search/scroll involved. For refreshing metrics (views/likes/shares/etc.) of posts that already exist elsewhere. Each URL costs one page visit (~3-8s), so for large batches (thousands+) split across multiple runs and/or pass a longer 'timeout' when starting the run - see README.",
+      "default": [],
+      "editor": "json"
+    },
+    "resultsPerPage": {
+      "title": "Results Per Page",
       "type": "integer",
-      "description": "Maximum number of items to scrape per query. Default is 200.",
-      "default": 200,
+      "description": "clockworks/tiktok-scraper-compatible alias for maxItems (used when maxItems is not set).",
+      "default": 150,
       "minimum": 1,
       "maximum": 1000,
       "editor": "number"
@@ -35,7 +84,7 @@
     "sessionCookies": {
       "title": "Session Cookies",
       "type": "string",
-      "description": "TikTok session cookies in one of these formats: 1) Raw Cookie header string, 2) JSON array (EditThisCookie/Playwright format), 3) Netscape cookies.txt format. Required fields: sessionid, sessionid_ss, sid_tt, sid_guard. When omitted, falls back to the TIKTOK_SESSION_COOKIES Actor environment variable - set that as a Secret env var in Apify Console rather than pasting a real cookie here.",
+      "description": "TikTok session cookies in one of these formats: 1) Raw Cookie header string, 2) JSON array (EditThisCookie/Playwright format), 3) Netscape cookies.txt format. Required fields: sessionid, sessionid_ss, sid_tt, sid_guard. When omitted (e.g. clockworks-compatible callers like red-pharmatiq-api never send this), falls back to the TIKTOK_SESSION_COOKIES Actor environment variable - set that as a Secret env var in Apify Console rather than pasting a real cookie here as a default.",
       "default": "",
       "editor": "textarea"
     },
@@ -57,7 +106,7 @@
           }
         }
       },
-      "description": "Multiple cookie sets for rotation. When omitted, falls back to the TIKTOK_COOKIE_POOL Actor environment variable.",
+      "description": "Multiple cookie sets for rotation. Useful for scaling and avoiding rate limits. When omitted and sessionCookies is also omitted, falls back to the TIKTOK_COOKIE_POOL Actor environment variable (a JSON array string in this same shape).",
       "default": [],
       "editor": "json"
     },
@@ -94,9 +143,10 @@
     "language": {
       "title": "Result Language",
       "type": "string",
-      "enum": ["id", "en", "ms", "th", "vi", "ja", "ko", "es", "pt"],
-      "description": "ISO language code used to scope search results (sets the lang URL parameter and the browser locale). Default is 'id' (Indonesian).",
-      "default": "id",
+      "enum": ["", "id", "en", "ms", "th", "vi", "ja", "ko", "es", "pt"],
+      "enumTitles": ["(none - don't scope by language)", "Indonesian", "English", "Malay", "Thai", "Vietnamese", "Japanese", "Korean", "Spanish", "Portuguese"],
+      "description": "ISO language code used to scope search results (sets the lang URL parameter and the browser locale). Left empty by default - red-pharmatiq-api's own ingestion pipeline already filters to id/en, so this doesn't need to narrow the scrape itself.",
+      "default": "",
       "editor": "select"
     },
     "includeComments": {
@@ -109,8 +159,7 @@
     "commentsPerPost": {
       "title": "Comments Per Post",
       "type": "integer",
-      "description": "Maximum number of comments to scrape per video.",
-      "default": 20,
+      "description": "Maximum number of comments to scrape per video. Only relevant when Include Comments is on - left unset by default since comment scraping isn't used yet (falls back to 20 internally if Include Comments is turned on without setting this).",
       "minimum": 1,
       "maximum": 100,
       "editor": "number"
@@ -125,9 +174,9 @@
     "outputSchema": {
       "title": "Output Schema",
       "type": "string",
-      "enum": ["compat", "native", "both"],
-      "description": "'compat' matches the Threads-style schema, 'native' is full TikTok data, 'both' includes all fields.",
-      "default": "compat",
+      "enum": ["clockworks", "compat", "native", "both"],
+      "description": "'clockworks' matches clockworks/tiktok-scraper's field names (default - red-pharmatiq-api's payloads never set this field, so it must work with no explicit opt-in). 'compat' matches the legacy Threads-style schema, 'native' is full TikTok data, 'both' includes all fields.",
+      "default": "clockworks",
       "editor": "select"
     },
     "useResidentialProxy": {
@@ -143,6 +192,21 @@
       "description": "Residential exit country when useResidentialProxy is true (e.g. 'ID'). Ignored when the proxy is off. Falls back to ID (or US for useast2a cookies) when left empty.",
       "default": "",
       "editor": "textfield"
+    },
+    "downloadSubtitlesOptions": {
+      "title": "Download Subtitles",
+      "type": "string",
+      "enum": ["NO_SUBTITLES", "DOWNLOAD_SUBTITLES"],
+      "description": "clockworks/tiktok-scraper-compatible field. 'DOWNLOAD_SUBTITLES' downloads TikTok's own closed-caption tracks (when present) and re-hosts them in this run's key-value store so they can be fetched without a TikTok session. Free — does not run paid speech-to-text for videos without subtitles.",
+      "default": "NO_SUBTITLES",
+      "editor": "select"
+    },
+    "scrapeRelatedSearchWords": {
+      "title": "Scrape related search words",
+      "type": "boolean",
+      "description": "Tick to include the keywords TikTok shows in the 'Others also searched for' section on the search results page. The words will be added to every video result from that search job (as videoMeta's sibling field relatedSearchWords). Search mode only (hashtags/searchQueries) - has no effect on profiles/postUrls. Read from the page UI (not a network response), so unverified live - if the diagnostic warning shows up in the run log, the selectors in extractRelatedSearchWords (src/main.js) need updating.",
+      "default": false,
+      "editor": "checkbox"
     }
   }
 }
