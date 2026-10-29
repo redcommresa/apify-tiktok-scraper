@@ -99,6 +99,7 @@ async function parseInput(input) {
   const proxyCountryCode = input.proxyCountryCode || null;
   const downloadSubtitles = input.downloadSubtitlesOptions === 'DOWNLOAD_SUBTITLES';
   const scrapeRelatedSearchWords = input.scrapeRelatedSearchWords || false;
+  const filterByKeyword = input.filterByKeyword === true;
 
   // Validate required fields
   if (!sessionCookies && (!cookiePool || cookiePool.length === 0)) {
@@ -151,6 +152,7 @@ async function parseInput(input) {
     proxyCountryCode,
     downloadSubtitles,
     scrapeRelatedSearchWords,
+    filterByKeyword,
   };
 }
 
@@ -469,20 +471,16 @@ async function scrapeQuery(page, context, job, config, kvStore) {
     dedupSet,
     meta: { inputValue: query, log },
     onItem: (item) => {
-      // Cap how many TikTok rows we even look at. Rejected rows still count,
-      // so a loose page cannot keep scrolling until it invents enough
-      // on-keyword hits.
-      if (examined >= config.maxItems) return;
+      if (results.length >= config.maxItems) return;
       examined += 1;
       if (!isWithinDateRange(item, config.dateRange)) {
         skippedByDate += 1;
         return;
       }
-      if (mode === 'search' && !postMatchesQuery(item, match || query)) {
+      if (config.filterByKeyword && mode === 'search' && !postMatchesQuery(item, match || query)) {
         skippedByKeyword += 1;
         return;
       }
-      if (results.length >= config.maxItems) return;
       results.push(item);
 
       if (config.downloadSubtitles) {
@@ -625,7 +623,7 @@ async function scrapeQuery(page, context, job, config, kvStore) {
       targetCount: config.maxItems,
       stallLimit: 3,
       scrollDelay: 2500,
-      getCount: () => examined,
+      getCount: () => results.length,
       onScroll: (info) => {
         log.info(`Scroll ${info.scrollCount}: captured=${info.currentCount} (${info.itemsGained} new)`);
       },
