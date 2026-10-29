@@ -29,7 +29,8 @@ An Apify actor that scrapes TikTok data using session cookies and network interc
 | `commentsPerPost` | integer | `20` | Max comments per video |
 | `downloadMedia` | boolean | `false` | Download media to KV store |
 | `outputSchema` | string | `compat` | Output format: `compat`, `native`, or `both` |
-| `proxyConfiguration` | object | `{"useApifyProxy": false}` | Apify Proxy or custom external proxy configuration |
+| `useResidentialProxy` | boolean | `false` | Opt-in Apify RESIDENTIAL proxy (billed per GB). Off by default to keep runs cheap |
+| `proxyCountryCode` | string | `""` | Residential exit country when `useResidentialProxy` is true (e.g. `ID`) — overrides the `tt-target-idc` guess. Falls back to ID (or US for useast2a cookies) when left empty |
 
 ### Cookie Format
 
@@ -64,24 +65,14 @@ Additional cookies that improve results:
 
 ### Proxy Configuration
 
-Proxies can be configured in two ways:
+Residential proxy is opt-in via `useResidentialProxy` (disabled by default to avoid residential proxy charges).
 
-1. **Via Actor Input (`proxyConfiguration`)**:
-   - In Apify UI, configure under the **Proxy** section (select Apify Residential/Datacenter proxy or provide custom external proxy URLs).
-   - In JSON input:
-     ```json
-     "proxyConfiguration": {
-       "useApifyProxy": false,
-       "proxyUrls": ["http://username:password@proxy-host.com:8000"]
-     }
-     ```
+1. **Via Actor Input**:
+   - `useResidentialProxy`: set to `true` to route traffic through Apify Residential proxies.
+   - `proxyCountryCode`: exit country code (e.g. `"ID"`). Falls back to cookie's target IDC if empty.
 
-2. **Via Environment Variables**:
-   - Set `CUSTOM_PROXY_URL`, `PROXY_URL`, or `APIFY_PROXY_URL` in Actor Settings or local `.env`:
-     ```bash
-     CUSTOM_PROXY_URL="http://username:password@proxy-host.com:8000"
-     ```
-   - Multiple proxy endpoints can be comma-separated or newline-separated. When multiple proxies are passed, the scraper deterministically pins each session to a proxy using the cookie hash.
+2. **Custom / Local Proxy**:
+   - Set `APIFY_PROXY_URL` or `PROXY_URL` in environment variables if testing locally or using a custom proxy endpoint.
 
 ## Output Schema
 

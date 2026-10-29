@@ -130,14 +130,19 @@
       "default": "compat",
       "editor": "select"
     },
-    "proxyConfiguration": {
-      "title": "Proxy Configuration",
-      "type": "object",
-      "description": "Proxy configuration for the actor. You can enable Apify Proxy (Residential recommended) or provide custom external proxy URLs.",
-      "default": {
-        "useApifyProxy": false
-      },
-      "editor": "proxy"
+    "useResidentialProxy": {
+      "title": "Use Residential Proxy",
+      "type": "boolean",
+      "description": "Opt-in Apify RESIDENTIAL proxy (billed per GB). Off by default to keep runs cheap. When true, traffic exits through residential IPs in proxyCountryCode (or ID/US inferred from cookie IDC). Images/video/fonts are still blocked to limit GB usage.",
+      "default": false,
+      "editor": "checkbox"
+    },
+    "proxyCountryCode": {
+      "title": "Proxy Country Code",
+      "type": "string",
+      "description": "Residential exit country when useResidentialProxy is true (e.g. 'ID'). Ignored when the proxy is off. Falls back to ID (or US for useast2a cookies) when left empty.",
+      "default": "",
+      "editor": "textfield"
     }
   }
 }

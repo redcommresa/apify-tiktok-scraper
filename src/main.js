@@ -7,7 +7,7 @@
  */
 
 import { Actor } from 'apify';
-import { PlaywrightCrawler, Configuration, ProxyConfiguration } from 'crawlee';
+import { PlaywrightCrawler, Configuration } from 'crawlee';
 import { firefox } from 'playwright-core';
 import { launchOptions as camoufoxLaunchOptions } from 'camoufox-js';
 import { readFileSync } from 'fs';
@@ -37,29 +37,6 @@ const DEFAULT_SCROLL_DELAY = 2000;
 const BLOCKED_RESOURCE_TYPES = new Set(['image', 'media', 'font']);
 const BLOCK_MEDIA = process.env.BLOCK_MEDIA !== 'false';
 
-/**
- * Split a proxy list into individual URLs. Accepts comma or newline separators
- * so multiple sticky endpoints can be passed in one env var.
- */
-function parseProxyUrls(raw) {
-  if (!raw) return [];
-  return raw
-    .split(/[\n,]/)
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-}
-
-/**
- * Strip credentials from a proxy URL so it is safe to log.
- */
-function redactProxyUrl(proxyUrl) {
-  try {
-    const { protocol, hostname, port } = new URL(proxyUrl);
-    return `${protocol}//${hostname}${port ? `:${port}` : ''}`;
-  } catch {
-    return '<unparseable proxy URL>';
-  }
-}
 
 /**
  * Parse and validate input
@@ -79,6 +56,9 @@ async function parseInput(input) {
   const commentsPerPost = input.commentsPerPost || 20;
   const downloadMedia = input.downloadMedia || false;
   const outputSchema = input.outputSchema || 'compat';
+  // Opt-in: RESIDENTIAL is billed per GB. Off by default; set true to enable.
+  const useResidentialProxy = input.useResidentialProxy === true;
+  const proxyCountryCode = input.proxyCountryCode || null;
 
   // Validate required fields
   if (!sessionCookies && (!cookiePool || cookiePool.length === 0)) {
@@ -126,7 +106,8 @@ async function parseInput(input) {
     commentsPerPost,
     downloadMedia,
     outputSchema,
-    proxyConfiguration: input.proxyConfiguration,
+    useResidentialProxy,
+    proxyCountryCode,
   };
 }
 
@@ -480,6 +461,11 @@ Actor.main(async () => {
   const targetIdc = getTargetIdc(config.cookies);
   log.info(`Session hash: ${cookieHash}, Target IDC: ${targetIdc || 'auto'}`);
 
+  // proxyCountryCode takes priority over the tt-target-idc-derived guess when choosing the proxy exit region.
+  // Indonesian TikTok also uses the alisg IDC — prefer ID there, not SG.
+  const proxyCountryCode = config.proxyCountryCode
+    || (targetIdc === 'useast2a' ? 'US' : 'ID');
+
   // Initialize session manager
   const sessions = config.cookiePool.length > 0
     ? config.cookiePool.map((c) => normalizeCookies(c.cookies))
@@ -597,34 +583,47 @@ Actor.main(async () => {
     },
   };
 
-  // Proxy configuration:
-  // 1. Check actor input proxyConfiguration (Apify Proxy or custom proxy URLs set in UI)
-  // 2. Fallback to environment variables (CUSTOM_PROXY_URL, PROXY_URL, APIFY_PROXY_URL)
-  if (config.proxyConfiguration) {
-    try {
-      const proxyConfig = await Actor.createProxyConfiguration(config.proxyConfiguration);
-      if (proxyConfig) {
-        crawlerOptions.proxyConfiguration = proxyConfig;
-        log.info('Using proxy configuration from actor input');
-      }
-    } catch (error) {
-      log.warning(`Failed to initialize proxy from input: ${error.message}`);
-    }
-  }
-
-  if (!crawlerOptions.proxyConfiguration) {
-    const proxyUrls = parseProxyUrls(
-      process.env.CUSTOM_PROXY_URL || process.env.PROXY_URL || process.env.APIFY_PROXY_URL
-    );
-    if (proxyUrls.length > 0) {
-      // BigInt keeps the 64-bit hash exact so the mapping is stable across runs
-      const proxyIndex = Number(BigInt(`0x${cookieHash}`) % BigInt(proxyUrls.length));
-      const proxyUrl = proxyUrls[proxyIndex];
-      log.info(`Using proxy ${redactProxyUrl(proxyUrl)} from environment (${proxyUrls.length} configured)`);
-      crawlerOptions.proxyConfiguration = new ProxyConfiguration({
-        proxyUrls: [proxyUrl],
+  // Residential proxy is opt-in via useResidentialProxy (billed per GB).
+  // Images/video/fonts stay blocked above so traffic is mostly HTML/JS/JSON.
+  if (config.useResidentialProxy) {
+    if (Actor.apifyClient) {
+      crawlerOptions.proxyConfiguration = await Actor.createProxyConfiguration({
+        groups: ['RESIDENTIAL'],
+        countryCode: proxyCountryCode,
       });
+      log.info(`Using Apify RESIDENTIAL proxy (country=${proxyCountryCode || 'auto'})`);
+    } else {
+      try {
+        crawlerOptions.proxyConfiguration = await Actor.createProxyConfiguration({
+          groups: ['RESIDENTIAL'],
+          countryCode: proxyCountryCode,
+        });
+        log.info(`Using Apify RESIDENTIAL proxy (country=${proxyCountryCode || 'auto'})`);
+      } catch {
+        const customProxyUrl = process.env.APIFY_PROXY_URL || process.env.PROXY_URL;
+        if (customProxyUrl) {
+          log.info(`Using custom proxy: ${customProxyUrl}`);
+          crawlerOptions.proxyConfiguration = {
+            proxyUrls: [customProxyUrl],
+          };
+          if (!crawlerOptions.launchContext.launchOptions) {
+            crawlerOptions.launchContext.launchOptions = {};
+          }
+          crawlerOptions.launchContext.launchOptions.proxy = {
+            server: customProxyUrl,
+          };
+        } else {
+          log.warning('useResidentialProxy=true but no proxy available.');
+          log.warning('Set APIFY_PROXY_PASSWORD or APIFY_TOKEN env var to use Apify Proxy locally.');
+          log.warning('Or set APIFY_PROXY_URL for a custom proxy.');
+        }
+      }
     }
+  } else {
+    log.info(
+      `Proxy disabled (useResidentialProxy=false)` +
+        (config.proxyCountryCode ? ` (proxyCountryCode=${config.proxyCountryCode} unused)` : '')
+    );
   }
 
   const crawler = new PlaywrightCrawler(crawlerOptions, Configuration.getGlobalConfig());
