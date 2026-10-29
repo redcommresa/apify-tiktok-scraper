@@ -63,6 +63,15 @@ At minimum, these cookies must be present:
 Additional cookies that improve results:
 - `ttwid`, `msToken`, `tt-target-idc`, `uid_tt`
 
+### Cookies via Environment Variables
+
+When `sessionCookies` and `cookiePool` are omitted from the input payload, the actor falls back to actor-level environment variables:
+
+- `TIKTOK_SESSION_COOKIES` — same formats as the `sessionCookies` input field (string).
+- `TIKTOK_COOKIE_POOL` — JSON array string, same shape as `cookiePool`.
+
+Set these in **Apify Console → Actor → Source tab / Settings → Environment variables**, marked **Secret** so credentials are encrypted and hidden from run logs. Do **not** put live cookies directly in `INPUT_SCHEMA.json` or committed config files.
+
 ### Proxy Configuration
 
 Residential proxy is opt-in via `useResidentialProxy` (disabled by default to avoid residential proxy charges).

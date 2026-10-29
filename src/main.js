@@ -39,14 +39,40 @@ const BLOCK_MEDIA = process.env.BLOCK_MEDIA !== 'false';
 
 
 /**
+ * Cookies fall back to actor-level environment variables when the input
+ * omits them entirely. Set these as Secret env vars on the Actor in
+ * Apify Console (Settings -> Environment variables), never as an
+ * INPUT_SCHEMA default - that would commit a live session credential to
+ * this repo's git history.
+ */
+function cookiesFromEnv() {
+  const sessionCookies = process.env.TIKTOK_SESSION_COOKIES || '';
+
+  let cookiePool = [];
+  if (process.env.TIKTOK_COOKIE_POOL) {
+    try {
+      const parsed = JSON.parse(process.env.TIKTOK_COOKIE_POOL);
+      if (Array.isArray(parsed)) cookiePool = parsed;
+    } catch {
+      // Malformed TIKTOK_COOKIE_POOL env var - ignored
+    }
+  }
+
+  return { sessionCookies, cookiePool };
+}
+
+/**
  * Parse and validate input
  */
 async function parseInput(input) {
+  const envCookies = cookiesFromEnv();
   const mode = input.mode || 'search';
   const queries = input.queries || [];
   const maxItems = input.maxItems || DEFAULT_MAX_ITEMS;
-  const sessionCookies = input.sessionCookies || '';
-  const cookiePool = input.cookiePool || [];
+  const sessionCookies = input.sessionCookies || envCookies.sessionCookies;
+  const cookiePool = (input.cookiePool && input.cookiePool.length > 0)
+    ? input.cookiePool
+    : envCookies.cookiePool;
   const sortBy = input.sortBy || 'relevance';
   const publishedWithin = input.publishedWithin || 'all';
   const dateFromMs = parseDateBound(input.dateFrom);
@@ -62,7 +88,7 @@ async function parseInput(input) {
 
   // Validate required fields
   if (!sessionCookies && (!cookiePool || cookiePool.length === 0)) {
-    throw new Error('Either sessionCookies or cookiePool must be provided');
+    throw new Error('Either sessionCookies, cookiePool, or TIKTOK_SESSION_COOKIES env var must be provided');
   }
 
   if (!queries.length) {

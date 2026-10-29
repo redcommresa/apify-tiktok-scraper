@@ -35,7 +35,7 @@
     "sessionCookies": {
       "title": "Session Cookies",
       "type": "string",
-      "description": "TikTok session cookies in one of these formats: 1) Raw Cookie header string, 2) JSON array (EditThisCookie/Playwright format), 3) Netscape cookies.txt format. Required fields: sessionid, sessionid_ss, sid_tt, sid_guard.",
+      "description": "TikTok session cookies in one of these formats: 1) Raw Cookie header string, 2) JSON array (EditThisCookie/Playwright format), 3) Netscape cookies.txt format. Required fields: sessionid, sessionid_ss, sid_tt, sid_guard. When omitted, falls back to the TIKTOK_SESSION_COOKIES Actor environment variable - set that as a Secret env var in Apify Console rather than pasting a real cookie here.",
       "default": "",
       "editor": "textarea"
     },
@@ -57,7 +57,7 @@
           }
         }
       },
-      "description": "Multiple cookie sets for rotation. Useful for scaling and avoiding rate limits.",
+      "description": "Multiple cookie sets for rotation. When omitted, falls back to the TIKTOK_COOKIE_POOL Actor environment variable.",
       "default": [],
       "editor": "json"
     },
