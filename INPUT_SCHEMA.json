@@ -214,20 +214,6 @@
       "description": "When true, drops videos that do not mention the query in the caption/hashtags. When false (default), keeps all videos returned by TikTok search without filtering recommendations.",
       "default": false,
       "editor": "checkbox"
-    },
-    "splitSearchByFilters": {
-      "title": "Split Search By Filters",
-      "type": "boolean",
-      "description": "Each TikTok search list stalls around ~200 posts. When true, every search keyword is also run under several sort (relevance/latest) x time-window (all/7d/30d/90d/180d) combinations and the results are merged and de-duplicated. More posts for the same keyword, but ~8x longer run: use 4096 MB memory and a long timeout.",
-      "default": false,
-      "editor": "checkbox"
-    },
-    "emulateIndonesia": {
-      "title": "Emulate Indonesian Browser",
-      "type": "boolean",
-      "description": "Sets browser locale id-ID, timezone Asia/Jakarta, Jakarta geolocation and Accept-Language id-ID so TikTok serves more Indonesian content without a residential proxy.",
-      "default": true,
-      "editor": "checkbox"
     }
   }
 }
