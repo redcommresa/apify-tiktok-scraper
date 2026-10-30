@@ -1,16 +1,19 @@
 {
   "mode": "search",
-  "queries": ["Samsung S26 FE"],
-  "maxItems": 100,
-  "sessionCookies": "sessionid=YOUR_SESSIONID; sessionid_ss=YOUR_SESSIONID; sid_tt=YOUR_SESSIONID; sid_guard=YOUR_SID_GUARD",
+  "queries": [
+    "Samsung ZFold8Ultra"
+  ],
+  "maxItems": 500,
   "sortBy": "relevance",
   "publishedWithin": "all",
   "dateFrom": "",
   "dateTo": "",
+  "language": "id",
   "includeComments": false,
   "commentsPerPost": 20,
   "downloadMedia": false,
   "outputSchema": "compat",
   "useResidentialProxy": false,
-  "proxyCountryCode": "ID"
+  "proxyCountryCode": "ID",
+  "filterByKeyword": false
 }

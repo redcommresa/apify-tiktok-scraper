@@ -100,6 +100,30 @@ async function parseInput(input) {
   const downloadSubtitles = input.downloadSubtitlesOptions === 'DOWNLOAD_SUBTITLES';
   const scrapeRelatedSearchWords = input.scrapeRelatedSearchWords || false;
   const filterByKeyword = input.filterByKeyword === true;
+  // Each TikTok search list stalls near ~200 posts. Running the same keyword
+  // under several sort/time-window combinations yields different lists.
+  const splitSearchByFilters = input.splitSearchByFilters === true;
+  const emulateIndonesia = input.emulateIndonesia !== false;
+
+  if (splitSearchByFilters) {
+    const variants = [
+      { sortBy: 'relevance', publishedWithin: 'all' },
+      { sortBy: 'latest', publishedWithin: 'all' },
+      { sortBy: 'relevance', publishedWithin: '7d' },
+      { sortBy: 'latest', publishedWithin: '7d' },
+      { sortBy: 'relevance', publishedWithin: '30d' },
+      { sortBy: 'latest', publishedWithin: '30d' },
+      { sortBy: 'relevance', publishedWithin: '90d' },
+      { sortBy: 'relevance', publishedWithin: '180d' },
+    ];
+    const expanded = [];
+    for (const job of jobs) {
+      if (job.mode !== 'search') { expanded.push(job); continue; }
+      for (const v of variants) expanded.push({ ...job, ...v });
+    }
+    jobs.length = 0;
+    jobs.push(...expanded);
+  }
 
   // Validate required fields
   if (!sessionCookies && (!cookiePool || cookiePool.length === 0)) {
@@ -153,6 +177,8 @@ async function parseInput(input) {
     downloadSubtitles,
     scrapeRelatedSearchWords,
     filterByKeyword,
+    splitSearchByFilters,
+    emulateIndonesia,
   };
 }
 
@@ -444,7 +470,7 @@ async function scrapeQuery(page, context, job, config, kvStore) {
   let examined = 0;
 
   // Build URL
-  const url = buildUrl(mode, query, config.sortBy, config.publishedWithin, config.language);
+  const url = buildUrl(mode, query, job.sortBy || config.sortBy, job.publishedWithin || config.publishedWithin, config.language);
   log.info(`Navigating to: ${url}`);
 
   // Diagnostic only for 'post' mode: if /api/item_detail/ turns out to be
@@ -732,6 +758,9 @@ Actor.main(async () => {
   const proxyCountryCode = config.proxyCountryCode
     || (targetIdc === 'useast2a' ? 'US' : 'ID');
 
+  // Posts already pushed by any job (variants of one keyword overlap heavily)
+  const globalSeen = new Set();
+
   // Create crawler
   const crawlerOptions = {
     maxRequestRetries: 3,
@@ -745,6 +774,7 @@ Actor.main(async () => {
     minConcurrency: 1,
     maxConcurrency: 5,
     launchContext: {
+      useIncognitoPages: true,
       launchOptions: {
         headless: true,
         args: [
@@ -804,6 +834,18 @@ Actor.main(async () => {
         gotoOptions.timeout = 30000;
       },
     ],
+    browserPoolOptions: config.emulateIndonesia ? {
+      prePageCreateHooks: [
+        (pageId, browserController, pageOptions) => {
+          if (!pageOptions) return;
+          pageOptions.locale = 'id-ID';
+          pageOptions.timezoneId = 'Asia/Jakarta';
+          pageOptions.geolocation = { latitude: -6.2088, longitude: 106.8456 };
+          pageOptions.permissions = ['geolocation'];
+          pageOptions.extraHTTPHeaders = { 'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.6,en;q=0.5' };
+        },
+      ],
+    } : undefined,
     async requestHandler({ page, request }) {
       const job = request.userData.job;
       const currentSession = sessionManager.getCurrent();
@@ -819,6 +861,11 @@ Actor.main(async () => {
         // Push items to dataset
         let pushed = 0;
         for (const item of result.items) {
+          const dedupKey = item.compat?.post_id || item.id;
+          if (dedupKey) {
+            if (globalSeen.has(dedupKey)) continue;
+            globalSeen.add(dedupKey);
+          }
           const filtered = filterByOutputSchema(item, config.outputSchema);
           if (filtered === null || filtered === undefined) continue;
           await Actor.pushData(filtered);
@@ -889,7 +936,8 @@ Actor.main(async () => {
 
   // Queue all jobs as requests
   const requests = config.jobs.map((job) => ({
-    url: buildUrl(job.mode, job.query, config.sortBy, config.publishedWithin, config.language),
+    url: buildUrl(job.mode, job.query, job.sortBy || config.sortBy, job.publishedWithin || config.publishedWithin, config.language),
+    uniqueKey: `${job.mode}|${job.query}|${job.sortBy || ''}|${job.publishedWithin || ''}`,
     userData: { job },
   }));
 
